@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-SRM WiFi Daemon - Core Engine
-Handles connection monitoring, captive portal detection, and automated 802.1X PEAP/MSCHAPv2 logins.
+SRM WiFi Daemon - Ultra-Reliable 802.1X Auto-Reconnect & 24h Watchdog
+Author: Machireddy Venkata Thanvish Reddy (RA2611027010109)
 """
 
 import os
@@ -13,7 +13,6 @@ import argparse
 from pathlib import Path
 from datetime import datetime, timedelta
 
-# Configuration
 CONFIG_DIR = Path.home() / ".config" / "srmist"
 CRED_FILE = CONFIG_DIR / "credentials.env"
 LOG_FILE = CONFIG_DIR / "srmist-daemon.log"
@@ -21,14 +20,12 @@ LOG_FILE = CONFIG_DIR / "srmist-daemon.log"
 CONNECTION_NAME = os.environ.get("SRMIST_CONNECTION", "SRMIST")
 IFACE = os.environ.get("SRMIST_IFACE", "wlan0")
 
-# Probes for testing true internet connectivity (fast, no heavy payload)
 PROBE_URLS = [
     "http://connectivitycheck.gstatic.com/generate_204",
     "http://detectportal.firefox.com/canonical.html",
     "http://clients3.google.com/generate_204"
 ]
 
-# Set up logging
 os.makedirs(CONFIG_DIR, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -41,56 +38,99 @@ logging.basicConfig(
 )
 log = logging.getLogger("srm-wifi")
 
-def load_credentials():
-    """Load credentials from ~/.config/srmist/credentials.env with strict permissions."""
-    if not CRED_FILE.exists():
-        log.error(f"Credentials file missing: {CRED_FILE}")
-        sys.exit(1)
-
-    stat = CRED_FILE.stat()
-    if oct(stat.st_mode)[-3:] != "600":
-        log.warning(f"Insecure permissions on {CRED_FILE} - fixing to 600")
-        CRED_FILE.chmod(0o600)
-
-    creds = {}
-    with open(CRED_FILE, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                key, _, value = line.partition("=")
-                creds[key.strip()] = value.strip().strip("'\"")
-
-    if "SRMIST_USER" not in creds or "SRMIST_PASS" not in creds:
-        log.error("SRMIST_USER or SRMIST_PASS missing from credentials file")
-        sys.exit(1)
-
-    return creds["SRMIST_USER"], creds["SRMIST_PASS"]
-
-def is_interface_up():
-    """Check if the physical wireless interface is connected to the network."""
+def run_cmd(cmd, timeout=30):
+    """Run a command, preferring sudo if normal execution fails authorization."""
     try:
-        # Check NM connection state
-        res = subprocess.run(["nmcli", "-t", "-f", "DEVICE,STATE", "device", "status"],
-                           capture_output=True, text=True, timeout=5)
-        for line in res.stdout.splitlines():
-            dev, state = line.split(":", 1)
-            if dev == IFACE and state == "connected":
-                return True
-        return False
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if res.returncode != 0 and "Not authorized" in res.stderr:
+            sudo_cmd = ["sudo", "-n"] + cmd
+            return subprocess.run(sudo_cmd, capture_output=True, text=True, timeout=timeout)
+        return res
     except Exception as e:
-        log.debug(f"Interface check failed: {e}")
-        return False
+        log.debug(f"Command execution error for {cmd}: {e}")
+        return None
+
+def load_credentials():
+    """Load credentials from ~/.config/srmist/credentials.env with fallback defaults."""
+    user = "vm7036"
+    password = "Nehitha21@"
+
+    if CRED_FILE.exists():
+        try:
+            with open(CRED_FILE, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        key, _, val = line.partition("=")
+                        k = key.strip()
+                        v = val.strip().strip("'\"")
+                        if k == "SRMIST_USER":
+                            user = v
+                        elif k == "SRMIST_PASS":
+                            password = v
+        except Exception as e:
+            log.warning(f"Could not read {CRED_FILE}: {e}")
+
+    return user, password
+
+def sync_networkmanager_profile():
+    """Ensure the NetworkManager profile has the exact 802.1X PEAP/MSCHAPv2 credentials."""
+    user, password = load_credentials()
+
+    # Check if connection exists
+    res = run_cmd(["nmcli", "-t", "-f", "NAME", "connection", "show"])
+    if res and CONNECTION_NAME in res.stdout.splitlines():
+        # Update existing profile
+        run_cmd([
+            "nmcli", "connection", "modify", CONNECTION_NAME,
+            "802-1x.eap", "peap",
+            "802-1x.identity", user,
+            "802-1x.anonymous-identity", user,
+            "802-1x.password", password,
+            "802-1x.phase2-auth", "mschapv2",
+            "802-1x.domain-suffix-match", "srmist.edu.in",
+            "connection.autoconnect", "yes",
+            "connection.autoconnect-priority", "10"
+        ])
+    else:
+        # Create connection if missing
+        run_cmd([
+            "nmcli", "connection", "add",
+            "type", "wifi",
+            "con-name", CONNECTION_NAME,
+            "ifname", IFACE,
+            "ssid", CONNECTION_NAME,
+            "wifi-sec.key-mgmt", "wpa-eap",
+            "802-1x.eap", "peap",
+            "802-1x.identity", user,
+            "802-1x.anonymous-identity", user,
+            "802-1x.password", password,
+            "802-1x.phase2-auth", "mschapv2",
+            "802-1x.domain-suffix-match", "srmist.edu.in"
+        ])
+
+def is_srmist_available():
+    """Check if SRMIST SSID is visible in the current environment."""
+    res = run_cmd(["nmcli", "-t", "-f", "SSID", "device", "wifi", "list"], timeout=10)
+    if res and CONNECTION_NAME in res.stdout.splitlines():
+        return True
+    return False
+
+def get_current_connection():
+    """Return the currently active Wi-Fi connection name."""
+    res = run_cmd(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status"])
+    if res and res.stdout:
+        for line in res.stdout.splitlines():
+            parts = line.split(":")
+            if len(parts) >= 4 and parts[0] == IFACE and parts[2] == "connected":
+                return parts[3]
+    return None
 
 def check_true_connectivity():
-    """Verify actual internet access to detect captive portals or silent drops."""
-    if not is_interface_up():
-        return False
-
+    """Verify true end-to-end internet connectivity."""
     import urllib.request
-    from urllib.error import URLError, HTTPError
     import ssl
 
-    # Disable cert verification for captive portal redirect checks
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -98,96 +138,92 @@ def check_true_connectivity():
     for url in PROBE_URLS:
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            resp = urllib.request.urlopen(req, timeout=5, context=ctx)
-            # A 204 No Content means we have direct access, no captive portal interception
-            if resp.getcode() == 204 or b"success" in resp.read(256).lower():
-                return True
-        except HTTPError as e:
-            # If intercepted by captive portal, it usually throws a redirect/error
-            if e.code in [200, 301, 302]:
-                log.warning("Captive portal intercepted the probe.")
-                return False
-        except Exception as e:
+            with urllib.request.urlopen(req, timeout=4, context=ctx) as resp:
+                if resp.getcode() == 204 or b"success" in resp.read(256).lower():
+                    return True
+        except Exception:
             continue
-
     return False
 
 def force_reconnect():
-    """Force NetworkManager to drop and rebuild the 802.1X PEAP session."""
+    """Execute clean 802.1X PEAP re-authentication."""
     user, _ = load_credentials()
-    log.info(f"Initiating full 802.1X re-authentication for user {user} on {CONNECTION_NAME}...")
+    log.info(f"Initiating full 802.1X re-authentication for user '{user}' on '{CONNECTION_NAME}'...")
 
-    # Drop connection
-    subprocess.run(["nmcli", "connection", "down", CONNECTION_NAME],
-                  capture_output=True, timeout=15)
-    time.sleep(2)
+    sync_networkmanager_profile()
 
-    # Re-establish
-    res = subprocess.run(["nmcli", "--wait", "90", "connection", "up", CONNECTION_NAME],
-                        capture_output=True, text=True, timeout=120)
+    # Drop and reconnect
+    run_cmd(["nmcli", "connection", "down", CONNECTION_NAME], timeout=10)
+    time.sleep(1)
 
-    if res.returncode == 0:
-        time.sleep(5)  # Wait for DHCP
+    res = run_cmd(["nmcli", "--wait", "60", "connection", "up", CONNECTION_NAME], timeout=90)
+    if res and res.returncode == 0:
+        time.sleep(3)
         if check_true_connectivity():
-            log.info("✅ Re-authentication successful and internet is reachable.")
+            log.info("✅ Connection established and internet is reachable.")
             return True
         else:
-            log.warning("⚠️ Network connected, but internet is NOT reachable (Captive Portal or DNS failure).")
-            return False
+            log.warning("⚠️ Connected to Wi-Fi, verifying egress gateway...")
+            time.sleep(3)
+            return check_true_connectivity()
     else:
-        log.error(f"❌ Failed to bring up connection: {res.stderr.strip()}")
+        err = res.stderr.strip() if res else "Command timed out"
+        log.error(f"❌ Connection activation failed: {err}")
         return False
 
 def daemon_mode():
-    """Run continuously, monitoring and fixing drops."""
-    log.info("🚀 SRM WiFi Daemon started. Monitoring network connectivity.")
+    """Continuous auto-reconnect and 24h watchdog loop."""
+    log.info("🚀 SRM WiFi Daemon running. Monitoring network health.")
+    sync_networkmanager_profile()
 
-    # Initialize variables for exponential backoff on failure
-    backoff = 10
-    max_backoff = 300
-
-    # 24-Hour Auth Expiration Tracker
-    # We preemptively force a reauth every 23.5 hours to prevent sudden drops during work
     last_forced_auth = datetime.now()
     FORCE_REAUTH_INTERVAL = timedelta(hours=23, minutes=30)
+    backoff = 10
+    max_backoff = 180
 
     while True:
         try:
-            # 1. Check if it's time for the daily 24-hour token refresh
             now = datetime.now()
-            if now - last_forced_auth >= FORCE_REAUTH_INTERVAL:
-                log.info("⏰ 24-hour token expiration approaching. Preemptively renewing 802.1X session.")
+            current_conn = get_current_connection()
+
+            # 1. Handle 24-hour proactive token expiration when on SRMIST
+            if current_conn == CONNECTION_NAME and (now - last_forced_auth >= FORCE_REAUTH_INTERVAL):
+                log.info("⏰ 24-hour token expiration approaching. Renewing 802.1X session proactively.")
                 if force_reconnect():
                     last_forced_auth = now
                     backoff = 10
 
             # 2. Check active connectivity
             if check_true_connectivity():
-                # All good, sleep and check again
                 time.sleep(15)
-                backoff = 10  # Reset backoff on success
+                backoff = 10
                 continue
 
-            # 3. Connection dropped or portal intercepted!
-            log.warning("🚨 Connectivity lost! Attempting recovery...")
-            if force_reconnect():
-                last_forced_auth = datetime.now()
-                backoff = 10
+            # 3. Connection dropped or no internet!
+            # Only attempt SRMIST connection if we were on SRMIST or SRMIST is in range
+            if current_conn == CONNECTION_NAME or current_conn is None or is_srmist_available():
+                log.warning("🚨 Internet connectivity lost! Re-authenticating SRMIST...")
+                if force_reconnect():
+                    last_forced_auth = datetime.now()
+                    backoff = 10
+                else:
+                    log.info(f"Retrying in {backoff}s...")
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, max_backoff)
             else:
-                log.info(f"Retrying in {backoff} seconds...")
-                time.sleep(backoff)
-                backoff = min(backoff * 2, max_backoff)
+                # Connected to a different network (e.g. personal hotspot/home), don't hijack it
+                time.sleep(20)
 
         except KeyboardInterrupt:
             log.info("Daemon stopped by user.")
             break
         except Exception as e:
-            log.error(f"Unexpected error in daemon loop: {e}")
-            time.sleep(30)
+            log.error(f"Unexpected loop exception: {e}")
+            time.sleep(15)
 
 def main():
     parser = argparse.ArgumentParser(description="SRMIST WiFi Keep-Alive & Auto-Authenticator")
-    parser.add_argument("--daemon", action="store_true", help="Run in continuous monitoring mode")
+    parser.add_argument("--daemon", action="store_true", help="Run continuous watchdog daemon")
     parser.add_argument("--force", action="store_true", help="Force immediate re-authentication")
     parser.add_argument("--status", action="store_true", help="Check current connectivity status")
 
@@ -195,13 +231,12 @@ def main():
 
     if args.status:
         if check_true_connectivity():
-            print("✅ SRMIST Network is CONNECTED and internet is REACHABLE.")
+            print("✅ Internet is reachable.")
+            cur = get_current_connection()
+            print(f"📡 Active Connection: {cur}")
             sys.exit(0)
-        elif is_interface_up():
-            print("⚠️ Interface is UP, but internet is UNREACHABLE (Login required).")
-            sys.exit(1)
         else:
-            print("❌ Interface is DOWN or disconnected.")
+            print("❌ Internet is unreachable.")
             sys.exit(1)
 
     if args.force:
@@ -212,9 +247,8 @@ def main():
     if args.daemon:
         daemon_mode()
     else:
-        # Default behavior: run once if disconnected, exit 0 if already connected
         if check_true_connectivity():
-            log.info("✅ Already connected and working.")
+            print("✅ Already connected.")
             sys.exit(0)
         if force_reconnect():
             sys.exit(0)
