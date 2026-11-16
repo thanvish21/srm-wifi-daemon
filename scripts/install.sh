@@ -3,12 +3,14 @@
 
 set -e
 
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 echo "📡 Installing SRM WiFi Daemon..."
 
 # Setup links
 mkdir -p ~/.local/bin
-ln -sf /home/thanvish/srm-wifi-daemon/src/srm_wifi.py ~/.local/bin/srmist-connect
-chmod +x /home/thanvish/srm-wifi-daemon/src/srm_wifi.py
+ln -sf "$REPO_DIR/src/srm_wifi.py" ~/.local/bin/srmist-connect
+chmod +x "$REPO_DIR/src/srm_wifi.py"
 
 # Disable old timer and service
 echo "🛑 Stopping and disabling old srmist-login service..."
@@ -18,7 +20,7 @@ systemctl --user disable srmist-login.timer srmist-login.service 2>/dev/null || 
 # Setup new service
 echo "⚙️ Configuring systemd daemon..."
 mkdir -p ~/.config/systemd/user/
-cp /home/thanvish/srm-wifi-daemon/systemd/srm-wifi-daemon.service ~/.config/systemd/user/
+sed "s|__REPO_DIR__|$REPO_DIR|g" "$REPO_DIR/systemd/srm-wifi-daemon.service" > ~/.config/systemd/user/srm-wifi-daemon.service
 
 # Ensure permissions on credentials
 mkdir -p ~/.config/srmist

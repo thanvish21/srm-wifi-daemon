@@ -73,9 +73,16 @@ def load_credentials():
 
     return user, password
 
+PLACEHOLDER_USER = "YOUR_SRM_NET_ID"
+PLACEHOLDER_PASS = "YOUR_PASSWORD_HERE"
+
+
 def sync_networkmanager_profile():
     """Ensure the NetworkManager profile has the exact 802.1X PEAP/MSCHAPv2 credentials."""
     user, password = load_credentials()
+    if user == PLACEHOLDER_USER or password == PLACEHOLDER_PASS:
+        log.error(f"Credentials not configured. Set SRMIST_USER and SRMIST_PASS in {CRED_FILE}")
+        return False
 
     # Check if connection exists
     res = run_cmd(["nmcli", "-t", "-f", "NAME", "connection", "show"])
@@ -132,8 +139,6 @@ def check_true_connectivity():
     import ssl
 
     ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
 
     for url in PROBE_URLS:
         try:
@@ -150,7 +155,8 @@ def force_reconnect():
     user, _ = load_credentials()
     log.info(f"Initiating full 802.1X re-authentication for user '{user}' on '{CONNECTION_NAME}'...")
 
-    sync_networkmanager_profile()
+    if sync_networkmanager_profile() is False:
+        return False
 
     # Drop and reconnect
     run_cmd(["nmcli", "connection", "down", CONNECTION_NAME], timeout=10)
@@ -201,7 +207,7 @@ def daemon_mode():
 
             # 3. Connection dropped or no internet!
             # Only attempt SRMIST connection if we were on SRMIST or SRMIST is in range
-            if current_conn == CONNECTION_NAME or current_conn is None or is_srmist_available():
+            if current_conn == CONNECTION_NAME or is_srmist_available():
                 log.warning("🚨 Internet connectivity lost! Re-authenticating SRMIST...")
                 if force_reconnect():
                     last_forced_auth = datetime.now()
